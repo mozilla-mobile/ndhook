@@ -1,3 +1,4 @@
+extern crate nimbledroidrs;
 extern crate slog;
 extern crate slog_async;
 extern crate slog_term;
@@ -5,16 +6,20 @@ extern crate tempdir;
 
 use tempdir::TempDir;
 
+use nimbledroidrs::Profiler;
 use percent_encoding::percent_decode;
 use serde_json::Value;
 use slog::{error, info, o, Drain, Logger};
+use std::convert::TryFrom;
+use std::fs::Permissions;
 use std::io::Result;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::ExitStatusExt;
 use std::process::Command;
+use std::time::Duration;
 use tide::App;
 use tide::Context;
 use tide::EndpointResult;
-use std::convert::TryFrom;
 
 struct PullRequestComment {
 	url: String,
@@ -29,33 +34,29 @@ impl TryFrom<Value> for PullRequestComment {
 		let pr_url = match &notification["issue"]["pull_request"]["url"] {
 			Value::String(s) => s,
 			_ => {
-				return Err(format!("Oops, couldn't find a PR url."));
+				return Err("Oops, couldn't find a PR url.".to_string());
 			}
 		};
 
 		let comments_url = match &notification["issue"]["comments_url"] {
 			Value::String(s) => s,
 			_ => {
-				return Err(format!("Oops, couldn't find a comments url."));
+				return Err("Oops, couldn't find a comments url.".to_string());
 			}
 		};
-
 
 		let comment = match &notification["comment"]["body"] {
 			Value::String(s) => s,
 			_ => {
-				return Err(format!("Oops, couldn't the comment body."));
+				return Err("Oops, couldn't the comment body.".to_string());
 			}
 		};
-
 
 		let pull_information_raw = match reqwest::get(pr_url) {
 			Ok(mut response) => match response.text() {
 				Ok(body) => body,
 				Err(e) => {
-					return Err(
-						format!("Oops, couldn't download PR information: {}", e)
-					);
+					return Err(format!("Oops, couldn't download PR information: {}", e));
 				}
 			},
 			Err(e) => {
@@ -75,17 +76,15 @@ impl TryFrom<Value> for PullRequestComment {
 
 		match clone_url {
 			Value::String(clone_url) => match head_sha {
-				Value::String(head_sha) => {
-					Ok(Self {
-						url: comments_url.to_string(),
-						clone_url: clone_url.to_string(),
-						head_sha: head_sha.to_string(),
-						comment: comment.to_string(),
-					})
-				}
-				_ => Err(format!("Oops, couldn't get the PR head's sha.")),
+				Value::String(head_sha) => Ok(Self {
+					url: comments_url.to_string(),
+					clone_url: clone_url.to_string(),
+					head_sha: head_sha.to_string(),
+					comment: comment.to_string(),
+				}),
+				_ => Err("Oops, couldn't get the PR head's sha.".to_string()),
 			},
-			_ => Err(format!("Oops, couldn't get the PR head's clone url.")),
+			_ => Err("Oops, couldn't get the PR head's clone url.".to_string()),
 		}
 	}
 }
@@ -112,12 +111,13 @@ impl ToExitCode for Result<std::process::ExitStatus> {
 	}
 }
 
-fn parse_body_bytes(bytes: &Vec<u8>) -> serde_json::Result<Value> {
+fn parse_body_bytes(bytes: &[u8]) -> serde_json::Result<Value> {
 	let decoded = percent_decode(bytes).decode_utf8().unwrap();
 	let body: String = decoded.to_string().replace("payload=", "");
 	serde_json::from_str(&body)
 }
 
+#[allow(clippy::cognitive_complexity)]
 fn take_action(state: ServerState, notification: Value) {
 	let logger = state.logger;
 
@@ -151,44 +151,36 @@ fn take_action(state: ServerState, notification: Value) {
 	// Create a directory to build in.
 	let temp_dir = TempDir::new("prefix");
 	if let Err(e) = temp_dir {
-		error!(logger, "(Err) Failed to make a working directory: {}", e);
+		error!(logger, "(Err) Failed to make an artifact directory: {}", e);
 		return;
 	}
 	let temp_dir = temp_dir.unwrap();
-	let work_area = temp_dir.path();
-	info!(logger, "Succeeded in making the work directory.");
+	let artifact_area = temp_dir.path();
+	let artifact_area_permissions = Permissions::from_mode(0o733);
+	if std::fs::set_permissions(&artifact_area, artifact_area_permissions).is_err() {
+		error!(
+			logger,
+			"(Err) Could not set the permissions on the artifact directory."
+		);
+		return;
+	}
+	info!(
+		logger,
+		"Succeeded in making the artifact directory and setting the permissions."
+	);
 
-	let clone_result = Command::new("git")
-		.arg("clone")
-		.current_dir(&work_area)
+	let build_result = Command::new("docker")
+		.arg("run")
+		.arg("--rm")
+		.arg("-ti")
+		.arg("--volume")
+		.arg(format!("{}:/build_output/", artifact_area.display()))
+		.arg("3683fdbe380c")
+		.arg("/buildtools/build_fenix.sh")
 		.arg(clone_url)
-		.arg("./")
-		.status();
-	if clone_result.to_exit_code() != 0 {
-		error!(
-			logger,
-			"Failed to clone: {}",
-			std::io::Error::from_raw_os_error(clone_result.to_exit_code())
-		);
-	}
-
-	let checkout_result = Command::new("git")
-		.arg("checkout")
-		.current_dir(&work_area)
 		.arg(head_sha)
-		.arg("./")
-		.status();
-	if checkout_result.to_exit_code() != 0 {
-		error!(
-			logger,
-			"Failed to checkout: {}",
-			std::io::Error::from_raw_os_error(checkout_result.to_exit_code())
-		);
-	}
-
-	let build_result = Command::new("./gradlew")
-		.arg("app:assembleGeckoNightlyFenixNightly")
-		.current_dir(&work_area)
+		.arg("assembleGeckoNightlyFenixNightly")
+		.arg("app/build/outputs/apk/*")
 		.status();
 	if build_result.to_exit_code() != 0 {
 		error!(
@@ -198,8 +190,62 @@ fn take_action(state: ServerState, notification: Value) {
 		);
 	}
 
-	let post_client = reqwest::Client::new();
-	match post_client.post(&pr_url).header(reqwest::header::AUTHORIZATION, format!("token {}", state.git_key).to_string()).body("{ \"body\": \"Plus one\" }").send() {
+	let profile = Profiler::new(
+		&state.nd_key,
+		&format!(
+			"{}/fenixNightly/app-geckoNightly-armeabi-v7a-fenixNightly-unsigned.apk",
+			&temp_dir.path().to_str().unwrap()
+		),
+	);
+	let profile_url: reqwest::Url;
+	match profile.upload() {
+		Ok(url) => profile_url = url,
+		Err(e) => {
+			error!(logger, "Failed to upload the artifact to ND: {}.", e);
+			return;
+		}
+	}
+
+	let mut comment_string = "".to_string();
+
+	info!(logger, "Starting to wait for the profile.");
+	if profile
+		.wait_for_profile(&profile_url, Duration::from_secs(1200))
+		.is_err()
+	{
+		comment_string =
+			"Timeout while waiting for ND to complete profiling the application.".to_string();
+		error!(logger, "{}", comment_string);
+	} else {
+		info!(logger, "Done waiting for the profile.");
+
+		if let Some(profile_result) = profile.get_profile_result(&profile_url) {
+			comment_string.push_str(&"Scenario | Status | Time (ms)\\n".to_string());
+			comment_string.push_str(&"---------|--------|----------\\n".to_string());
+			for p in profile_result.profiles {
+				comment_string.push_str(&format!(
+					"{} | {} | {}\\n",
+					p.get_scenario_name(),
+					p.get_status(),
+					p.get_time_in_ms()
+				));
+			}
+		} else {
+			comment_string = "Failed to get the results of the profile from ND.".to_string();
+			error!(logger, "{}", comment_string);
+		}
+	}
+
+	let comment_post_client = reqwest::Client::new();
+	match comment_post_client
+		.post(&pr_url)
+		.header(
+			reqwest::header::AUTHORIZATION,
+			format!("token {}", state.git_key),
+		)
+		.body(format!("{{ \"body\": \"{}\" }}", comment_string))
+		.send()
+	{
 		Ok(o) => {
 			info!(logger, "Posted a comment: {:?}", o);
 		}
@@ -241,7 +287,10 @@ async fn handle_post(mut request: Context<ServerState>) -> EndpointResult<String
 				info!(request.state().logger, "End spawn(take_action).");
 			}
 			Err(e) => {
-				error!(request.state().logger, "Oops, could not parse the body of the notification: {}", e);
+				error!(
+					request.state().logger,
+					"Oops, could not parse the body of the notification: {}", e
+				);
 			}
 		}
 	}
