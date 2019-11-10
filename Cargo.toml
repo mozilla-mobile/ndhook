@@ -9,7 +9,7 @@ edition = "2018"
 
 [dependencies]
 # futures-preview = "0.3.0-alpha.19"
-tide = { git = "https://github.com/http-rs/tide" }
+tide = { git = "https://github.com/http-rs/tide", rev="dfbaf72a" }
 serde_json = "1.0.41"
 percent-encoding = "2.1.0"
 # hyper = "0.12.27"
@@ -18,3 +18,4 @@ slog = "*"
 slog-term = "2.4-2"
 slog-async = "2.3.0"
 tempdir = "0.3.7"
+nimbledroidrs = { git = "https://github.com/hawkinsw/nimbledroidrs" }
