@@ -17,6 +17,7 @@ use percent_encoding::percent_decode;
 use serde_json::Value;
 use slog::{error, info, o, Drain, Logger};
 use std::convert::TryFrom;
+use std::fs::File;
 use std::fs::Permissions;
 use std::io::Result;
 use std::os::unix::fs::PermissionsExt;
@@ -32,6 +33,7 @@ struct PullRequestComment {
 	clone_url: String,
 	head_sha: String,
 	comment: String,
+	commenter: String,
 }
 
 impl TryFrom<Value> for PullRequestComment {
@@ -54,7 +56,14 @@ impl TryFrom<Value> for PullRequestComment {
 		let comment = match &notification["comment"]["body"] {
 			Value::String(s) => s,
 			_ => {
-				return Err("Oops, couldn't the comment body.".to_string());
+				return Err("Oops, couldn't find the comment body.".to_string());
+			}
+		};
+
+		let commenter = match &notification["comment"]["user"]["login"] {
+			Value::String(s) => s,
+			_ => {
+				return Err("Oops, couldn't find the commenter.".to_string());
 			}
 		};
 
@@ -87,6 +96,7 @@ impl TryFrom<Value> for PullRequestComment {
 					clone_url: clone_url.to_string(),
 					head_sha: head_sha.to_string(),
 					comment: comment.to_string(),
+					commenter: commenter.to_string(),
 				}),
 				_ => Err("Oops, couldn't get the PR head's sha.".to_string()),
 			},
@@ -144,13 +154,20 @@ fn take_action(state: ServerState, notification: Value) {
 	let head_sha = pull_request.head_sha;
 	let pr_url = pull_request.url;
 	let comment = pull_request.comment;
+	let commenter = pull_request.commenter;
 	info!(logger, "clone_url: {}", clone_url);
 	info!(logger, "head_sha: {}", head_sha);
 	info!(logger, "pr_url: {}", pr_url);
 	info!(logger, "comment: {}", comment);
+	info!(logger, "commenter: {}", commenter);
 
 	if comment != "profile" {
 		info!(logger, "Bad command: {}", comment);
+		return;
+	}
+
+	if !state.profilers.contains(&commenter.to_lowercase()) {
+		info!(logger, "Bad commenter: {} not found in {:?}", commenter, state.profilers);
 		return;
 	}
 
@@ -267,14 +284,16 @@ fn take_action(state: ServerState, notification: Value) {
 struct ServerState {
 	pub git_key: String,
 	pub nd_key: String,
+	pub profilers: Vec<String>,
 	pub logger: Logger,
 }
 
 impl ServerState {
-	fn new(git_key: String, nd_key: String, logger: Logger) -> Self {
+	fn new(git_key: String, nd_key: String, profilers: &[String], logger: Logger) -> Self {
 		Self {
 			git_key,
 			nd_key,
+			profilers: profilers.to_vec(),
 			logger,
 		}
 	}
@@ -304,6 +323,18 @@ async fn handle_post(mut request: Context<ServerState>) -> EndpointResult<String
 	Ok("Success".to_string())
 }
 
+fn profilers_from_file(filename: &str) -> Vec<String> {
+	if let Ok(f) = File::open(filename) {
+		if let Ok(profilers) = serde_json::from_reader(f) {
+			profilers
+		} else {
+			vec![]
+		}
+	} else {
+		vec![]
+	}
+}
+
 fn main() {
 	let decorator = slog_term::TermDecorator::new().build();
 	let drain = slog_term::FullFormat::new(decorator).build().fuse();
@@ -312,9 +343,13 @@ fn main() {
 
 	info!(log, "Starting.");
 
+	let profilers = profilers_from_file("./profilers.json");
+	let lc_profilers: Vec<String> = profilers.into_iter().map(|s| s.to_lowercase()).collect();
+
 	let mut server = App::with_state(ServerState::new(
 		"git_key".to_string(),
 		"nd_key".to_string(),
+		&lc_profilers,
 		log,
 	));
 	server.at("/").post(handle_post);
