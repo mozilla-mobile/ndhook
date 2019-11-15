@@ -36,6 +36,8 @@ struct PullRequestComment {
 	commenter: String,
 }
 
+static ONE_HOUR: u64 = 3600;
+
 impl TryFrom<Value> for PullRequestComment {
 	type Error = String;
 	fn try_from(notification: Value) -> std::result::Result<Self, Self::Error> {
@@ -233,7 +235,7 @@ fn take_action(state: ServerState, notification: Value) {
 
 	info!(logger, "Starting to wait for the profile.");
 	if profile
-		.wait_for_profile(&profile_url, Duration::from_secs(1200))
+		.wait_for_profile(&profile_url, Duration::from_secs(2*ONE_HOUR))
 		.is_err()
 	{
 		comment_string =
